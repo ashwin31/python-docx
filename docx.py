@@ -1,5 +1,5 @@
-#!/usr/bin/env python2.6
-# -*- coding: utf-8 -*-
+# encoding: utf-8
+
 """
 Open and modify Microsoft Word 2007 docx files (called 'OpenXML' and
 'Office OpenXML' by Microsoft)
@@ -8,18 +8,30 @@ Part of Python's docx module - http://github.com/mikemaccana/python-docx
 See LICENSE for licensing information.
 """
 
-import logging
+import os
+import re
+import time
+import shutil
+import zipfile
+
 from lxml import etree
+from os.path import abspath, basename, join
+
 try:
     from PIL import Image
 except ImportError:
     import Image
-import zipfile
-import shutil
-import re
-import time
-import os
-from os.path import join
+
+try:
+    from PIL.ExifTags import TAGS
+except ImportError:
+    TAGS = {}
+
+from exceptions import PendingDeprecationWarning
+from warnings import warn
+
+import logging
+
 
 log = logging.getLogger(__name__)
 
@@ -92,7 +104,7 @@ def makeelement(tagname, tagtext=None, nsprefix='w', attributes=None,
         # FIXME: rest of code below expects a single prefix
         nsprefix = nsprefix[0]
     if nsprefix:
-        namespace = '{'+nsprefixes[nsprefix]+'}'
+        namespace = '{%s}' % nsprefixes[nsprefix]
     else:
         # For when namespace = None
         namespace = ''
@@ -300,7 +312,7 @@ def table(contents, heading=True, colw=None, cwunit='dxa', tblw=0,
                             'nil'  : no width
                             'auto' : automagically determined
     @param int  tblw:     Table width
-    @param int  twunit:   Unit used for table width. Same possible values as
+    @param str  twunit:   Unit used for table width. Same possible values as
                           cwunit.
     @param dict borders:  Dictionary defining table border. Supported keys
                           are: 'top', 'left', 'bottom', 'right',
@@ -421,37 +433,89 @@ def table(contents, heading=True, colw=None, cwunit='dxa', tblw=0,
 
 def picture(
         relationshiplist, picname, picdescription, pixelwidth=None,
-        pixelheight=None, nochangeaspect=True, nochangearrowheads=True):
+        pixelheight=None, nochangeaspect=True, nochangearrowheads=True,
+        imagefiledict=None):
     """
     Take a relationshiplist, picture file name, and return a paragraph
-    containing the image and an updated relationshiplist.
+    containing the image and an updated relationshiplist
     """
+    if imagefiledict is None:
+        warn(
+            'Using picture() without imagefiledict parameter will be depreca'
+            'ted in the future.', PendingDeprecationWarning
+        )
+
     # http://openxmldeveloper.org/articles/462.aspx
     # Create an image. Size may be specified, otherwise it will based on the
-    # pixel size of image. Return a paragraph containing the picture'''
-    # Copy the file into the media dir
-    media_dir = join(template_dir, 'word', 'media')
-    if not os.path.isdir(media_dir):
-        os.mkdir(media_dir)
-    shutil.copyfile(picname, join(media_dir, picname))
+    # pixel size of image. Return a paragraph containing the picture
+
+    # Set relationship ID to that of the image or the first available one
+    picid = '2'
+    picpath = abspath(picname)
+
+    if imagefiledict is not None:
+        # Keep track of the image files in a separate dictionary so they don't
+        # need to be copied into the template directory
+        if picpath not in imagefiledict:
+            picrelid = 'rId' + str(len(relationshiplist) + 1)
+            imagefiledict[picpath] = picrelid
+
+            relationshiplist.append([
+                'http://schemas.openxmlformats.org/officeDocument/2006/relat'
+                'ionships/image',
+                'media/%s_%s' % (picrelid, basename(picpath))
+            ])
+        else:
+            picrelid = imagefiledict[picpath]
+    else:
+        # Copy files into template directory for backwards compatibility
+        # Images still accumulate in the template directory this way
+        picrelid = 'rId' + str(len(relationshiplist) + 1)
+
+        relationshiplist.append([
+            'http://schemas.openxmlformats.org/officeDocument/2006/relations'
+            'hips/image', 'media/' + picname
+        ])
+
+        media_dir = join(template_dir, 'word', 'media')
+        if not os.path.isdir(media_dir):
+            os.mkdir(media_dir)
+        shutil.copyfile(picname, join(media_dir, picname))
+
+    image = Image.open(picpath)
+
+    # Extract EXIF data, if available
+    try:
+        exif = image._getexif()
+        exif = {} if exif is None else exif
+    except:
+        exif = {}
+
+    imageExif = {}
+    for tag, value in exif.items():
+        imageExif[TAGS.get(tag, tag)] = value
+
+    imageOrientation = imageExif.get('Orientation', 1)
+    imageAngle = {
+        1: 0, 2: 0, 3: 180, 4: 0, 5: 90, 6: 90, 7: 270, 8: 270
+    }[imageOrientation]
+    imageFlipH = 'true' if imageOrientation in (2, 5, 7) else 'false'
+    imageFlipV = 'true' if imageOrientation == 4 else 'false'
 
     # Check if the user has specified a size
     if not pixelwidth or not pixelheight:
         # If not, get info from the picture itself
-        pixelwidth, pixelheight = Image.open(picname).size[0:2]
+        pixelwidth, pixelheight = image.size[0:2]
+
+    # Swap width and height if necessary
+    if imageOrientation in (5, 6, 7, 8):
+        pixelwidth, pixelheight = pixelheight, pixelwidth
 
     # OpenXML measures on-screen objects in English Metric Units
     # 1cm = 36000 EMUs
     emuperpixel = 12700
     width = str(pixelwidth * emuperpixel)
     height = str(pixelheight * emuperpixel)
-
-    # Set relationship ID to the first available
-    picid = '2'
-    picrelid = 'rId'+str(len(relationshiplist)+1)
-    relationshiplist.append([
-        ('http://schemas.openxmlformats.org/officeDocument/2006/relationship'
-         's/image'), 'media/'+picname])
 
     # There are 3 main elements inside a picture
     # 1. The Blipfill - specifies how the image fills the picture area
@@ -468,7 +532,8 @@ def picture(
     nvpicpr = makeelement('nvPicPr', nsprefix='pic')
     cnvpr = makeelement(
         'cNvPr', nsprefix='pic',
-        attributes={'id': '0', 'name': 'Picture 1', 'descr': picname})
+        attributes={'id': '0', 'name': 'Picture 1', 'descr': picdescription}
+    )
     nvpicpr.append(cnvpr)
     cnvpicpr = makeelement('cNvPicPr', nsprefix='pic')
     cnvpicpr.append(makeelement(
@@ -479,13 +544,23 @@ def picture(
 
     # 3. The Shape properties
     sppr = makeelement('spPr', nsprefix='pic', attributes={'bwMode': 'auto'})
-    xfrm = makeelement('xfrm', nsprefix='a')
-    xfrm.append(makeelement(
-        'off', nsprefix='a', attributes={'x': '0', 'y': '0'}))
-    xfrm.append(makeelement(
-        'ext', nsprefix='a', attributes={'cx': width, 'cy': height}))
+    xfrm = makeelement(
+        'xfrm', nsprefix='a', attributes={
+            'rot': str(imageAngle * 60000), 'flipH': imageFlipH,
+            'flipV': imageFlipV
+        }
+    )
+    xfrm.append(
+        makeelement('off', nsprefix='a', attributes={'x': '0', 'y': '0'})
+    )
+    xfrm.append(
+        makeelement(
+            'ext', nsprefix='a', attributes={'cx': width, 'cy': height}
+        )
+    )
     prstgeom = makeelement(
-        'prstGeom', nsprefix='a', attributes={'prst': 'rect'})
+        'prstGeom', nsprefix='a', attributes={'prst': 'rect'}
+    )
     prstgeom.append(makeelement('avLst', nsprefix='a'))
     sppr.append(xfrm)
     sppr.append(prstgeom)
@@ -532,7 +607,11 @@ def picture(
     run.append(drawing)
     paragraph = makeelement('p')
     paragraph.append(run)
-    return relationshiplist, paragraph
+
+    if imagefiledict is not None:
+        return relationshiplist, paragraph, imagefiledict
+    else:
+        return relationshiplist, paragraph
 
 
 def search(document, search):
@@ -970,9 +1049,18 @@ def wordrelationships(relationshiplist):
     return relationships
 
 
-def savedocx(document, coreprops, appprops, contenttypes, websettings,
-             wordrelationships, output):
-    '''Save a modified document'''
+def savedocx(
+        document, coreprops, appprops, contenttypes, websettings,
+        wordrelationships, output, imagefiledict=None):
+    """
+    Save a modified document
+    """
+    if imagefiledict is None:
+        warn(
+            'Using savedocx() without imagefiledict parameter will be deprec'
+            'ated in the future.', PendingDeprecationWarning
+        )
+
     assert os.path.isdir(template_dir)
     docxfile = zipfile.ZipFile(
         output, mode='w', compression=zipfile.ZIP_DEFLATED)
@@ -982,16 +1070,25 @@ def savedocx(document, coreprops, appprops, contenttypes, websettings,
     os.chdir(template_dir)
 
     # Serialize our trees into out zip file
-    treesandfiles = {document:     'word/document.xml',
-                     coreprops:    'docProps/core.xml',
-                     appprops:     'docProps/app.xml',
-                     contenttypes: '[Content_Types].xml',
-                     websettings:  'word/webSettings.xml',
-                     wordrelationships: 'word/_rels/document.xml.rels'}
+    treesandfiles = {
+        document:          'word/document.xml',
+        coreprops:         'docProps/core.xml',
+        appprops:          'docProps/app.xml',
+        contenttypes:      '[Content_Types].xml',
+        websettings:       'word/webSettings.xml',
+        wordrelationships: 'word/_rels/document.xml.rels'
+    }
     for tree in treesandfiles:
         log.info('Saving: %s' % treesandfiles[tree])
         treestring = etree.tostring(tree, pretty_print=True)
         docxfile.writestr(treesandfiles[tree], treestring)
+
+    # Add & compress images, if applicable
+    if imagefiledict is not None:
+        for imagepath, picrelid in imagefiledict.items():
+            archivename = 'word/media/%s_%s' % (picrelid, basename(imagepath))
+            log.info('Saving: %s', archivename)
+            docxfile.write(imagepath, archivename)
 
     # Add & compress support files
     files_to_ignore = ['.DS_Store']  # nuisance from some os's
@@ -1003,6 +1100,7 @@ def savedocx(document, coreprops, appprops, contenttypes, websettings,
             archivename = templatefile[2:]
             log.info('Saving: %s', archivename)
             docxfile.write(templatefile, archivename)
+
     log.info('Saved new file to: %r', output)
     docxfile.close()
     os.chdir(prev_dir)  # restore previous working dir
